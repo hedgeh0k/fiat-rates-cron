@@ -11,8 +11,10 @@ client
 
 export default async function fetchAndSaveRates() {
     try {
-        const response = await fetch('[FIAT_RATES_API_ENDPOINT]');
-        const rates = await response.json();
+        const response = await fetch(`https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`);
+        const rates = json.data;
+
+        const ratesArray = Object.keys(rates).map(key => [key, rates[key].value]);
 
         // Format the date as DDMMYYYY
         const dateStr = new Date().toLocaleDateString('en-GB').replace(/\//g, '');
