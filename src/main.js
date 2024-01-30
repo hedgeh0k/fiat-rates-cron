@@ -1,7 +1,7 @@
 import fetch from 'node-fetch';
-import appwrite from 'node-appwrite';
+import { Client, Databases } from "appwrite";
 
-const { Client, Database } = appwrite;
+// const { Client, Database } = appwrite;
 
 // Initialize Appwrite client
 let client = new Client();
