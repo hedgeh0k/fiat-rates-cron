@@ -25,7 +25,7 @@ export default async function fetchAndSaveRates() {
 
         let document = {
             date: dateStr,
-            rates: JSON.stringify(rates)
+            jsonRates: JSON.stringify(rates)
         };
 
         if (documentId) {
