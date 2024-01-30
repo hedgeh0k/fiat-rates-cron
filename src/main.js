@@ -1,33 +1,40 @@
-import { Client } from 'node-appwrite';
+const fetch = require('node-fetch');
+const sdk = require('node-appwrite');
 
-// This is your Appwrite function
-// It's executed each time we get a request
-export default async ({ req, res, log, error }) => {
-  // Why not try the Appwrite SDK?
-  //
-  // const client = new Client()
-  //    .setEndpoint('https://cloud.appwrite.io/v1')
-  //    .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-  //    .setKey(process.env.APPWRITE_API_KEY);
+// Initialize Appwrite client
+let client = new sdk.Client();
+let database = new sdk.Database(client);
 
-  // You can log messages to the console
-  log('Hello, Logs!');
+client
+    .setEndpoint('http://[YOUR_APPWRITE_ENDPOINT]') // Your Appwrite Endpoint
+    .setProject('YOUR_PROJECT_ID') // Your project ID
+    .setKey('YOUR_API_KEY'); // Your secret API key
 
-  // If something goes wrong, log an error
-  error('Hello, Errors!');
+export default async function fetchAndSaveRates() {
+    try {
+        const response = await fetch('[FIAT_RATES_API_ENDPOINT]');
+        const rates = await response.json();
 
-  // The `req` object contains the request data
-  if (req.method === 'GET') {
-    // Send a response with the res object helpers
-    // `res.send()` dispatches a string back to the client
-    return res.send('Hello, World!');
-  }
+        // Format the date as DDMMYYYY
+        const dateStr = new Date().toLocaleDateString('en-GB').replace(/\//g, '');
 
-  // `res.json()` is a handy helper for sending JSON
-  return res.json({
-    motto: 'Build like a team of hundreds_',
-    learn: 'https://appwrite.io/docs',
-    connect: 'https://appwrite.io/discord',
-    getInspired: 'https://builtwith.appwrite.io',
-  });
-};
+        // Check if a document with this date already exists
+        let searchResponse = await database.listDocuments('YOUR_COLLECTION_ID', [`date=${dateStr}`]);
+        let documentId = searchResponse.documents.length > 0 ? searchResponse.documents[0].$id : null;
+
+        let document = {
+            date: dateStr,
+            rates: JSON.stringify(rates)
+        };
+
+        if (documentId) {
+            // Update the existing document
+            await database.updateDocument('YOUR_COLLECTION_ID', documentId, document);
+        } else {
+            // Create a new document
+            await database.createDocument('YOUR_COLLECTION_ID', document);
+        }
+    } catch (error) {
+        console.error('Error fetching or saving rates:', error);
+    }
+}
