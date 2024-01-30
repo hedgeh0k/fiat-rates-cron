@@ -6,9 +6,8 @@ let client = new sdk.Client();
 let database = new sdk.Database(client);
 
 client
-    .setEndpoint('http://[YOUR_APPWRITE_ENDPOINT]') // Your Appwrite Endpoint
-    .setProject('YOUR_PROJECT_ID') // Your project ID
-    .setKey('YOUR_API_KEY'); // Your secret API key
+    .setProject(process.env.PROJECT_ID)
+    .setKey(process.env.APPWRITE_API_KEY);
 
 export default async function fetchAndSaveRates() {
     try {
@@ -19,7 +18,7 @@ export default async function fetchAndSaveRates() {
         const dateStr = new Date().toLocaleDateString('en-GB').replace(/\//g, '');
 
         // Check if a document with this date already exists
-        let searchResponse = await database.listDocuments('YOUR_COLLECTION_ID', [`date=${dateStr}`]);
+        let searchResponse = await database.listDocuments(process.env.COLLECTION_ID, [`date=${dateStr}`]);
         let documentId = searchResponse.documents.length > 0 ? searchResponse.documents[0].$id : null;
 
         let document = {
@@ -29,10 +28,10 @@ export default async function fetchAndSaveRates() {
 
         if (documentId) {
             // Update the existing document
-            await database.updateDocument('YOUR_COLLECTION_ID', documentId, document);
+            await database.updateDocument(process.env.COLLECTION_ID, documentId, document);
         } else {
             // Create a new document
-            await database.createDocument('YOUR_COLLECTION_ID', document);
+            await database.createDocument(process.env.COLLECTION_ID, document);
         }
     } catch (error) {
         console.error('Error fetching or saving rates:', error);
