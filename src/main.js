@@ -1,9 +1,9 @@
-const fetch = require('node-fetch');
-const sdk = require('node-appwrite');
+import fetch from 'node-fetch';
+import { Client, Database } from 'node-appwrite';
 
 // Initialize Appwrite client
-let client = new sdk.Client();
-let database = new sdk.Database(client);
+let client = new Client();
+let database = new Database(client);
 
 client
     .setProject(process.env.PROJECT_ID)
