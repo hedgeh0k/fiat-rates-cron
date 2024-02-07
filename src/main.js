@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { Client, Databases } from "node-appwrite";
+import { Client, Databases, Query } from "node-appwrite";
 
 export default async function fetchAndSaveRates(context) {
     try {
@@ -10,7 +10,7 @@ export default async function fetchAndSaveRates(context) {
         client.setKey(process.env.APPWRITE_API_KEY);
 
         const response = await axios.get(`https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`);
-        const rates = response?.data ?? {};
+        const rates = response?.data?.data ?? {};
 
         console.log("Retrieved rates", rates);
 
@@ -20,7 +20,11 @@ export default async function fetchAndSaveRates(context) {
         console.log("Checking for date:", DDMMYYYY, ratesArray);
 
         // Check if a document with this date already exists
-        let searchResponse = await database.listDocuments(process.env.DATABASE_ID, process.env.COLLECTION_ID, [`date=${DDMMYYYY}`]);
+        let searchResponse = await database.listDocuments(
+            process.env.DATABASE_ID,
+            process.env.COLLECTION_ID,
+            [Query.equal("date", `${DDMMYYYY}`)]
+        );
         let documentId = searchResponse.documents.length > 0 ? searchResponse.documents[0].$id : null;
 
         const document = {
