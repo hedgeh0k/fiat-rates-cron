@@ -12,7 +12,7 @@ export default async function fetchAndSaveRates(context) {
         const response = await axios.get(`https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`);
         const rates = response?.data ?? {};
 
-        context.log("Retrieved rates", rates);
+        console.log("Retrieved rates", rates);
 
         const ratesArray = Object.keys(rates).map(key => [key, rates[key].value]);
 
@@ -27,18 +27,18 @@ export default async function fetchAndSaveRates(context) {
             jsonRates: JSON.stringify(ratesArray)
         };
         if (documentId) {
-            context.log("Updating existing:", documentId, document);
+            console.log("Updating existing:", documentId, document);
             // Update the existing document
             await database.updateDocument(process.env.DATABASE_ID, process.env.COLLECTION_ID, documentId, document);
         } else {
-            context.log("Saving new:", documentId, document);
+            console.log("Saving new:", documentId, document);
             // Create a new document
             await database.createDocument(process.env.DATABASE_ID, process.env.COLLECTION_ID, document);
         }
-        context.log("Done:", documentId);
+        console.log("Done:", documentId);
         return context?.res ? context.res.json({ ok: true, rates: rates }) : undefined;
     } catch (error) {
-        context.error("Error fetching or saving rates:", error);
+        console.error("Error fetching or saving rates:", error);
         return context?.res ? context.res.json({ ok: false, error: error }) : undefined;
     }
 }
