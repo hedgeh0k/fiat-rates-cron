@@ -17,15 +17,24 @@ export default async function fetchAndSaveRates(context) {
         const ratesArray = Object.keys(rates).map(key => [key, rates[key].value]);
         const DDMMYYYY = new Date().toLocaleDateString("en-GB").replace(/\//g, "");
 
-        console.log("Checking for date:", DDMMYYYY, ratesArray);
+        console.log("Checking for date:", DDMMYYYY, process.env.DATABASE_ID,
+            process.env.COLLECTION_ID, ratesArray);
 
         // Check if a document with this date already exists
-        let searchResponse = await database.listDocuments(
+        let searchResponse = database.listDocuments(
             process.env.DATABASE_ID,
-            process.env.COLLECTION_ID
+            process.env.COLLECTION_ID,
+            [
+                Query.equal("date", DDMMYYYY)
+            ]
         );
-        // [Query.equal("date", `${DDMMYYYY}`)]
 
+        searchResponse.then(function (response) {
+            console.log(response);
+            searchResponse = response;
+        }, function (error) {
+            console.log(error);
+        });
         console.log("Response:", searchResponse);
 
         let documentId = searchResponse.documents.length > 0 ? searchResponse.documents[0].$id : null;
