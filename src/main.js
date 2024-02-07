@@ -29,11 +29,11 @@ export default async function fetchAndSaveRates(context) {
             ]
         );
 
-        searchResponse.then(function (response) {
-            console.log(response);
+        await searchResponse.then(function (response) {
+            console.log("RESP: ", response);
             searchResponse = response;
         }, function (error) {
-            console.log(error);
+            console.log("ERR: ", error);
         });
         console.log("Response:", searchResponse);
 
