@@ -2,6 +2,7 @@ import axios from 'axios';
 import {Client, Databases} from "node-appwrite";
 
 export default async function fetchAndSaveRates(context) {
+    console.log("ENV: ", process.env);
     try {
         let client = new Client();
         let database = new Databases(client);
