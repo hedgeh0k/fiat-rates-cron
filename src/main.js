@@ -23,10 +23,10 @@ export default async function fetchAndSaveRates(context) {
         let searchResponse = await database.listDocuments(
             process.env.DATABASE_ID,
             process.env.COLLECTION_ID
-            // [Query.equal("date", `${DDMMYYYY}`)]
         );
+        // [Query.equal("date", `${DDMMYYYY}`)]
 
-        console.log("Response:", response);
+        console.log("Response:", searchResponse);
 
         let documentId = searchResponse.documents.length > 0 ? searchResponse.documents[0].$id : null;
 
