@@ -22,9 +22,12 @@ export default async function fetchAndSaveRates(context) {
         // Check if a document with this date already exists
         let searchResponse = await database.listDocuments(
             process.env.DATABASE_ID,
-            process.env.COLLECTION_ID,
-            [Query.equal("date", `${DDMMYYYY}`)]
+            process.env.COLLECTION_ID
+            // [Query.equal("date", `${DDMMYYYY}`)]
         );
+
+        console.log("Response:", response);
+
         let documentId = searchResponse.documents.length > 0 ? searchResponse.documents[0].$id : null;
 
         const document = {
