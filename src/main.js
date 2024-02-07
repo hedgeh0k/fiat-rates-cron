@@ -1,7 +1,7 @@
 import axios from 'axios';
 import {Client, Databases} from "node-appwrite";
 
-export default async function fetchAndSaveRates(/*{ req, res }*/) {
+export default async function fetchAndSaveRates(context) {
     try {
         let client = new Client();
         let database = new Databases(client);
@@ -35,7 +35,9 @@ export default async function fetchAndSaveRates(/*{ req, res }*/) {
             // Create a new document
             await database.createDocument(process.env.COLLECTION_ID, document);
         }
+        return context?.res ? context.res.json({ ok: true, rates: rates }) : undefined;
     } catch (error) {
         console.error("Error fetching or saving rates:", error);
+        return context?.res ? context.res.json({ ok: false, error: error }) : undefined;
     }
 }
