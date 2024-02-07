@@ -1,25 +1,23 @@
-import fetch from 'node-fetch';
-import { Client, Databases } from "appwrite";
+import axios from 'axios';
+import {Client, Databases} from "node-appwrite";
 
-// const { Client, Database } = appwrite;
-
-// Initialize Appwrite client
-let client = new Client();
-let database = new Database(client);
-
-client
-    .setProject(process.env.PROJECT_ID)
-    .setKey(process.env.APPWRITE_API_KEY);
-
-export default async function fetchAndSaveRates() {
+export default async function fetchAndSaveRates(/*{ req, res }*/) {
     try {
-        const response = await fetch(`https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`);
-        const rates = json.data;
+        let client = new Client();
+        let database = new Databases(client);
+        client.setEndpoint("https://cloud.appwrite.io/v1");
+        client.setProject(process.env.PROJECT_ID);
+        client.setKey(process.env.APPWRITE_API_KEY);
+
+        const response = await axios.get(`https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`);
+        const rates = response?.data ?? {};
+
+        console.log("rates", rates);
 
         const ratesArray = Object.keys(rates).map(key => [key, rates[key].value]);
 
         // Format the date as DDMMYYYY
-        const dateStr = new Date().toLocaleDateString('en-GB').replace(/\//g, '');
+        const dateStr = new Date().toLocaleDateString("en-GB").replace(/\//g, '');
 
         // Check if a document with this date already exists
         let searchResponse = await database.listDocuments(process.env.COLLECTION_ID, [`date=${dateStr}`]);
@@ -27,7 +25,7 @@ export default async function fetchAndSaveRates() {
 
         let document = {
             date: dateStr,
-            jsonRates: JSON.stringify(rates)
+            jsonRates: JSON.stringify(ratesArray)
         };
 
         if (documentId) {
@@ -38,6 +36,6 @@ export default async function fetchAndSaveRates() {
             await database.createDocument(process.env.COLLECTION_ID, document);
         }
     } catch (error) {
-        console.error('Error fetching or saving rates:', error);
+        console.error("Error fetching or saving rates:", error);
     }
 }
