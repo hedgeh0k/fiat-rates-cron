@@ -20,6 +20,12 @@ export default async function fetchAndSaveRates(context) {
         console.log("Checking for date:", DDMMYYYY, process.env.DATABASE_ID,
             process.env.COLLECTION_ID, ratesArray);
 
+        try {
+            console.log("ALL docs: ", await database.listDocuments(process.env.DATABASE_ID, process.env.COLLECTION_ID));
+        } catch (e) {
+            console.log("Failed getting all docs: ", e);
+        }
+
         // Check if a document with this date already exists
         let searchResponse = database.listDocuments(
             process.env.DATABASE_ID,
