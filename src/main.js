@@ -39,7 +39,7 @@ export default async function fetchAndSaveRates(context) {
         } else {
             console.log("Saving new:", documentId, document);
             // Create a new document
-            await database.createDocument(process.env.DATABASE_ID, process.env.COLLECTION_ID, document);
+            await database.createDocument(process.env.DATABASE_ID, process.env.COLLECTION_ID, documentId, document);
         }
         console.log("Done:", documentId);
         return context?.res ? context.res.json({ ok: true, rates: rates }) : undefined;
