@@ -1,4 +1,3 @@
-import axios from "axios";
 import { Client, Databases, Query, ID } from "node-appwrite";
 
 export default async function fetchAndSaveRates(context) {
@@ -9,10 +8,11 @@ export default async function fetchAndSaveRates(context) {
         client.setProject(process.env.PROJECT_ID);
         client.setKey(process.env.APPWRITE_API_KEY);
 
-        const response = await axios.get(
+        const currencyResponse = await fetch(
             `https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`
         );
-        const rates = response?.data?.data ?? {};
+        const currencyJson = await currencyResponse.json();
+        const rates = currencyJson?.data ?? {};
 
         console.log("Retrieved rates", rates);
 
@@ -36,9 +36,12 @@ export default async function fetchAndSaveRates(context) {
                 ? searchResponse.documents[0].$id
                 : null;
 
+        const cryptoRates = await fetchCryptoMarketData();
+
         const document = {
             date: DDMMYYYY,
             jsonRates: JSON.stringify(ratesArray),
+            jsonCryptos: JSON.stringify(cryptoRates),
         };
         if (documentId) {
             console.log("Updating existing:", documentId, document);
@@ -61,6 +64,7 @@ export default async function fetchAndSaveRates(context) {
             );
         }
         console.log("Done:", documentId);
+
         return context?.res
             ? context.res.json({ ok: true, rates: rates })
             : undefined;
@@ -70,4 +74,37 @@ export default async function fetchAndSaveRates(context) {
             ? context.res.json({ ok: false, error: error })
             : undefined;
     }
+}
+
+async function fetchCryptoMarketData() {
+    if (!process.env.CRYPTORANK_API_KEY) {
+        console.log("CryptoRank key not set, skipping crypto fetch");
+        return [];
+    }
+
+    const baseUrl = "https://api.cryptorank.io/v2";
+    const headers = { "X-Api-Key": process.env.CRYPTORANK_API_KEY };
+
+    const limit = 100;
+    let skip = 0;
+    const result = [];
+
+    while (true) {
+        const res = await fetch(
+            `${baseUrl}/currencies?limit=${limit}&skip=${skip}`,
+            { headers }
+        );
+        if (!res.ok) {
+            console.error("CryptoRank currencies fetch failed", res.status);
+            break;
+        }
+        const page = await res.json();
+        const currencies = page.data || [];
+
+        result.push(...currencies);
+        if (currencies.length < limit) break;
+        skip += limit;
+    }
+
+    return result;
 }
