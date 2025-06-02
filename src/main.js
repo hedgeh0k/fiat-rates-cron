@@ -1,85 +1,105 @@
-// file: src/main.js
-import { Client, Databases, Query, ID } from "node-appwrite";
+import { Client, Databases, Query, ID, Functions } from "node-appwrite";
 
+async function fetchWithRetry(url, opts = {}, max = 3, log = console.log) {
+    for (let attempt = 1; attempt <= max; ++attempt) {
+        try {
+            const res = await fetch(url, opts);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.json();
+        } catch (e) {
+            log(`⚠️  ${url} failed (attempt ${attempt}):`, e.message);
+            if (attempt === max) throw e;
+            await new Promise((r) => setTimeout(r, 2 ** attempt * 1_000));
+        }
+    }
+}
+
+/** --------------- main entry --------------- */
 export default async function fetchAndSaveRates(context) {
-    const log = (...args) =>
-        context?.log ? context.log(...args) : console.log(...args);
-    const logError = (...args) =>
-        context?.error ? context.error(...args) : console.error(...args);
+    const log = (...a) => (context?.log ?? console.log)(...a);
+    const logError = (...a) => (context?.error ?? console.error)(...a);
 
     try {
-        const client = new Client();
-        const database = new Databases(client);
-        client
+        const client = new Client()
             .setEndpoint("https://cloud.appwrite.io/v1")
             .setProject(process.env.PROJECT_ID)
             .setKey(process.env.APPWRITE_API_KEY);
 
-        log(
-            "Env vars set:",
-            Boolean(process.env.PROJECT_ID),
-            Boolean(process.env.DATABASE_ID),
-            Boolean(process.env.COLLECTION_ID)
-        );
+        const db = new Databases(client);
+        const functions = new Functions(client); // for e-mail alert
 
-        /* ---------- Fiat rates ---------- */
-        const currencyResponse = await fetch(
-            `https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`
-        );
-        const currencyJson = await currencyResponse.json();
-        const rates = currencyJson?.data ?? {};
-
-        log("Retrieved rates", rates);
-
-        const ratesArray = Object.entries(rates).map(([code, { value }]) => [
-            code,
-            value,
+        const [fiatJson, cryptoRaw] = await Promise.all([
+            fetchWithRetry(
+                `https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`,
+                {},
+                2,
+                log
+            ),
+            fetchCryptoMarketData(log, logError), // see below
         ]);
-        const DDMMYYYY = new Date()
+
+        const fiatRates = Object.entries(fiatJson?.data ?? {}).map(
+            ([code, { value }]) => [code, value]
+        );
+        const cryptoRates = cryptoRaw.map((c) => [c.symbol, c.price]);
+        const cryptoMeta = Object.fromEntries(
+            cryptoRaw.map((c) => [
+                c.symbol,
+                { id: c.id, name: c.name, icon: c.images?.icon },
+            ])
+        );
+
+        /* ----------- Sanity checks -------------- */
+        const mustHaveFiat = ["USD", "EUR", "RUB"];
+        const missingFiat = mustHaveFiat.filter(
+            (c) => !fiatRates.some(([code]) => code === c)
+        );
+        const hasBTC = cryptoRates.some(([sym]) => sym === "BTC");
+
+        if (missingFiat.length || !hasBTC) {
+            throw new Error("Sanity check failed, aborting save");
+        }
+
+        /* ----------- Upsert in DB --------------- */
+        const dateStr = new Date()
             .toLocaleDateString("en-GB")
             .replace(/\//g, "");
-
-        /* ---------- Crypto rates ---------- */
-        const cryptoRates = await fetchCryptoMarketData(log, logError);
-
-        /* ---------- Upsert document ---------- */
-        const whereDate = [Query.equal("date", DDMMYYYY)];
-        const existing = await database.listDocuments(
+        const search = await db.listDocuments(
             process.env.DATABASE_ID,
             process.env.COLLECTION_ID,
-            whereDate
+            [Query.equal("date", dateStr)]
         );
-        const documentId =
-            existing.total > 0 ? existing.documents[0].$id : ID.unique();
 
-        const payload = {
-            date: DDMMYYYY,
-            jsonRates: JSON.stringify(ratesArray),
-            jsonCryptos: JSON.stringify(cryptoRates),
+        const docId = search.total ? search.documents[0].$id : ID.unique();
+        const record = {
+            date: dateStr,
+            fiatRates: JSON.stringify(fiatRates),
+            cryptoRates: JSON.stringify(cryptoRates),
+            cryptoMeta: JSON.stringify(cryptoMeta),
         };
 
-        if (existing.total > 0) {
-            log("Updating:", documentId);
-            await database.updateDocument(
+        if (search.total) {
+            log("Updating doc", docId);
+            await db.updateDocument(
                 process.env.DATABASE_ID,
                 process.env.COLLECTION_ID,
-                documentId,
-                payload
+                docId,
+                record
             );
         } else {
-            log("Creating:", documentId);
-            await database.createDocument(
+            log("Creating doc", docId);
+            await db.createDocument(
                 process.env.DATABASE_ID,
                 process.env.COLLECTION_ID,
-                documentId,
-                payload
+                docId,
+                record
             );
         }
 
-        log("Done:", documentId);
-        return context?.res?.json({ ok: true, rates });
+        log("✅ Rates stored", docId);
+        return context?.res?.json({ ok: true });
     } catch (err) {
-        logError("Error fetching or saving rates:", err);
+        logError("⛔ Cron failed:", err);
         return context?.res?.json({ ok: false, error: String(err) });
     }
 }
@@ -89,31 +109,25 @@ async function fetchCryptoMarketData(
     logError = console.error
 ) {
     if (!process.env.CRYPTORANK_API_KEY) {
-        log("CryptoRank key not set, skipping crypto fetch");
+        log("CryptoRank key absent → skip crypto");
         return [];
     }
-
-    const baseUrl = "https://api.cryptorank.io/v2";
+    const base = "https://api.cryptorank.io/v2/currencies";
     const headers = { "X-Api-Key": process.env.CRYPTORANK_API_KEY };
-
     const limit = 100;
-    let skip = 0;
-    const all = [];
+    let skip = 0,
+        out = [];
 
     while (true) {
-        const res = await fetch(
-            `${baseUrl}/currencies?limit=${limit}&skip=${skip}`,
-            { headers }
+        const { data = [] } = await fetchWithRetry(
+            `${base}?limit=${limit}&skip=${skip}`,
+            { headers },
+            3,
+            log
         );
-        if (!res.ok) {
-            logError("CryptoRank fetch failed:", res.status);
-            break;
-        }
-        const { data = [] } = await res.json();
-        all.push(...data);
+        out.push(...data);
         if (data.length < limit) break;
         skip += limit;
     }
-
-    return all;
+    return out;
 }
