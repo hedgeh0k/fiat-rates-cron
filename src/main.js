@@ -45,7 +45,24 @@ export default async function fetchAndSaveRates(context) {
         const cryptoMeta = Object.fromEntries(
             cryptoRaw.map((c) => [
                 c.symbol,
-                { id: c.id, name: c.name, icon: c.images?.icon },
+                {
+                    id: c.id,
+                    name: c.name,
+                    rank: c.rank,
+                    type: c.type,
+                    lastUpdated: c.lastUpdated,
+                    totalSupply: c.totalSupply,
+                    maxSupply: c.maxSupply,
+                    circulatingSupply: c.circulatingSupply,
+                    price: c.price,
+                    high24h: c.high24h,
+                    low24h: c.low24h,
+                    volume24h: c.volume24h,
+                    marketCap: c.marketCap,
+                    ath: c.ath, // keeps date, value, % change
+                    atl: c.atl,
+                    images: c.images, // x60, x150, icon, native
+                },
             ])
         );
 
