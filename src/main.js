@@ -1,17 +1,20 @@
+// file: src/main.js
 import { Client, Databases, Query, ID } from "node-appwrite";
 
 export default async function fetchAndSaveRates(context) {
     const log = (...args) =>
         context?.log ? context.log(...args) : console.log(...args);
-    const error = (...args) =>
+    const logError = (...args) =>
         context?.error ? context.error(...args) : console.error(...args);
 
     try {
         const client = new Client();
         const database = new Databases(client);
-        client.setEndpoint("https://cloud.appwrite.io/v1");
-        client.setProject(process.env.PROJECT_ID);
-        client.setKey(process.env.APPWRITE_API_KEY);
+        client
+            .setEndpoint("https://cloud.appwrite.io/v1")
+            .setProject(process.env.PROJECT_ID)
+            .setKey(process.env.APPWRITE_API_KEY);
+
         log(
             "Env vars set:",
             Boolean(process.env.PROJECT_ID),
@@ -19,6 +22,7 @@ export default async function fetchAndSaveRates(context) {
             Boolean(process.env.COLLECTION_ID)
         );
 
+        /* ---------- Fiat rates ---------- */
         const currencyResponse = await fetch(
             `https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`
         );
@@ -27,67 +31,63 @@ export default async function fetchAndSaveRates(context) {
 
         log("Retrieved rates", rates);
 
-        const ratesArray = Object.keys(rates).map((key) => [
-            key,
-            rates[key].value,
+        const ratesArray = Object.entries(rates).map(([code, { value }]) => [
+            code,
+            value,
         ]);
         const DDMMYYYY = new Date()
             .toLocaleDateString("en-GB")
             .replace(/\//g, "");
 
-        // Check if a document with this date already exists
-        let searchResponse = await database.listDocuments(
+        /* ---------- Crypto rates ---------- */
+        const cryptoRates = await fetchCryptoMarketData(log, logError);
+
+        /* ---------- Upsert document ---------- */
+        const whereDate = [Query.equal("date", DDMMYYYY)];
+        const existing = await database.listDocuments(
             process.env.DATABASE_ID,
             process.env.COLLECTION_ID,
-            [Query.equal("date", DDMMYYYY)]
+            whereDate
         );
+        const documentId =
+            existing.total > 0 ? existing.documents[0].$id : ID.unique();
 
-        let documentId =
-            searchResponse.documents.length > 0
-                ? searchResponse.documents[0].$id
-                : null;
-
-        const cryptoRates = await fetchCryptoMarketData(log, error);
-
-        const document = {
+        const payload = {
             date: DDMMYYYY,
             jsonRates: JSON.stringify(ratesArray),
             jsonCryptos: JSON.stringify(cryptoRates),
         };
-        if (documentId) {
-            log("Updating existing:", documentId, document);
-            // Update the existing document
+
+        if (existing.total > 0) {
+            log("Updating:", documentId);
             await database.updateDocument(
                 process.env.DATABASE_ID,
                 process.env.COLLECTION_ID,
                 documentId,
-                document
+                payload
             );
         } else {
-            documentId = ID.unique();
-            log("Saving new:", documentId, document);
-            // Create a new document
+            log("Creating:", documentId);
             await database.createDocument(
                 process.env.DATABASE_ID,
                 process.env.COLLECTION_ID,
                 documentId,
-                document
+                payload
             );
         }
-        log("Done:", documentId);
 
-        return context?.res
-            ? context.res.json({ ok: true, rates: rates })
-            : undefined;
-    } catch (error) {
-        error("Error fetching or saving rates:", error);
-        return context?.res
-            ? context.res.json({ ok: false, error: error })
-            : undefined;
+        log("Done:", documentId);
+        return context?.res?.json({ ok: true, rates });
+    } catch (err) {
+        logError("Error fetching or saving rates:", err);
+        return context?.res?.json({ ok: false, error: String(err) });
     }
 }
 
-async function fetchCryptoMarketData(log = console.log, error = console.error) {
+async function fetchCryptoMarketData(
+    log = console.log,
+    logError = console.error
+) {
     if (!process.env.CRYPTORANK_API_KEY) {
         log("CryptoRank key not set, skipping crypto fetch");
         return [];
@@ -98,7 +98,7 @@ async function fetchCryptoMarketData(log = console.log, error = console.error) {
 
     const limit = 100;
     let skip = 0;
-    const result = [];
+    const all = [];
 
     while (true) {
         const res = await fetch(
@@ -106,16 +106,14 @@ async function fetchCryptoMarketData(log = console.log, error = console.error) {
             { headers }
         );
         if (!res.ok) {
-            error("CryptoRank currencies fetch failed", res.status);
+            logError("CryptoRank fetch failed:", res.status);
             break;
         }
-        const page = await res.json();
-        const currencies = page.data || [];
-
-        result.push(...currencies);
-        if (currencies.length < limit) break;
+        const { data = [] } = await res.json();
+        all.push(...data);
+        if (data.length < limit) break;
         skip += limit;
     }
 
-    return result;
+    return all;
 }
