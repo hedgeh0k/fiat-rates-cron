@@ -30,7 +30,7 @@ export default async function fetchAndSaveRates(context) {
 
         const [fiatJson, cryptoRaw] = await Promise.all([
             fetchWithRetry(
-                `https://api.currencyapi.com/v3/latest?apikey=${process.env.RATES_API_KEY}`,
+                `https://api.currencyapi.com/v3/latest?type=fiat&apikey=${process.env.RATES_API_KEY}`,
                 {},
                 2,
                 log
