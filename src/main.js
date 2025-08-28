@@ -77,39 +77,91 @@ export default async function fetchAndSaveRates(context) {
             throw new Error("Sanity check failed, aborting save");
         }
 
-        /* ----------- Upsert in DB --------------- */
+        /* ----------- Upsert in new DBs --------------- */
         const dateStr = new Date()
             .toLocaleDateString("en-GB")
             .replace(/\//g, "");
-        const search = await db.listDocuments(
-            process.env.DATABASE_ID,
-            process.env.COLLECTION_ID,
+
+        // Target: new rates database/collection
+        const ratesDbId = process.env.RATES1_DATABASE_ID;
+        const ratesCollectionId = process.env.RATES_COMBINED_COLLECTION_ID;
+        const metaDbId = process.env.CRYPTOMETA_DATABASE_ID;
+        const metaCollectionId = process.env.CRYPTOMETA_COLLECTION_ID;
+
+        if (!ratesDbId || !ratesCollectionId)
+            throw new Error(
+                "Missing RATES1_DATABASE_ID or RATES_COMBINED_COLLECTION_ID"
+            );
+        if (!metaDbId || !metaCollectionId)
+            throw new Error(
+                "Missing CRYPTOMETA_DATABASE_ID or CRYPTOMETA_COLLECTION_ID"
+            );
+
+        // Upsert today's rates (no cryptoMeta here)
+        const todaySearch = await db.listDocuments(
+            ratesDbId,
+            ratesCollectionId,
             [Query.equal("date", dateStr)]
         );
-
-        const docId = search.total ? search.documents[0].$id : ID.unique();
-        const record = {
+        const docId = todaySearch.total
+            ? todaySearch.documents[0].$id
+            : ID.unique();
+        const ratesRecord = {
             date: dateStr,
             fiatRates: JSON.stringify(fiatRates),
             cryptoRates: JSON.stringify(cryptoRates),
-            cryptoMeta: JSON.stringify(cryptoMeta),
         };
 
-        if (search.total) {
-            log("Updating doc", docId);
+        if (todaySearch.total) {
+            log("Updating rates doc (new DB)", docId);
             await db.updateDocument(
-                process.env.DATABASE_ID,
-                process.env.COLLECTION_ID,
+                ratesDbId,
+                ratesCollectionId,
                 docId,
-                record
+                ratesRecord
             );
         } else {
-            log("Creating doc", docId);
+            log("Creating rates doc (new DB)", docId);
             await db.createDocument(
-                process.env.DATABASE_ID,
-                process.env.COLLECTION_ID,
+                ratesDbId,
+                ratesCollectionId,
                 docId,
-                record
+                ratesRecord
+            );
+        }
+
+        // Upsert today's cryptoMeta into its dedicated database/collection
+        if (cryptoRaw.length) {
+            await upsertCryptoMetaDocument(
+                db,
+                metaDbId,
+                metaCollectionId,
+                dateStr,
+                JSON.stringify(cryptoMeta),
+                log
+            );
+        } else {
+            log("No crypto meta fetched today — skipping cryptoMeta upsert.");
+        }
+
+        // Optional: full migration from old DB/collection → new DBs
+        if (process.env.MIGRATE_TO_NEW_DB === "1") {
+            await migrateFromOldToNewDatabases(
+                db,
+                {
+                    oldDbId: process.env.DATABASE_ID,
+                    oldCollectionId: process.env.COLLECTION_ID,
+                },
+                {
+                    ratesDbId,
+                    ratesCollectionId,
+                },
+                {
+                    metaDbId,
+                    metaCollectionId,
+                },
+                log,
+                logError
             );
         }
 
@@ -147,4 +199,162 @@ async function fetchCryptoMarketData(
         skip += limit;
     }
     return out;
+}
+
+// ---------- helpers: meta upsert + full-database migration ----------
+async function upsertCryptoMetaDocument(
+    db,
+    databaseId,
+    collectionId,
+    dateStr,
+    metaString,
+    log
+) {
+    const metaDocId = dateStr; // per-day doc id
+    const payload = {
+        date: dateStr,
+        cryptoMeta: metaString,
+        symbolsCount: safeCountSymbols(metaString),
+    };
+    try {
+        await db.createDocument(databaseId, collectionId, metaDocId, payload);
+        log("Created cryptoMeta doc", metaDocId);
+    } catch (e) {
+        await db.updateDocument(databaseId, collectionId, metaDocId, payload);
+        log("Updated cryptoMeta doc", metaDocId);
+    }
+};
+
+function safeCountSymbols(metaString) {
+    try {
+        return Object.keys(JSON.parse(metaString)).length;
+    } catch {
+        return 0;
+    }
+}
+
+async function migrateFromOldToNewDatabases(
+    db,
+    { oldDbId, oldCollectionId },
+    { ratesDbId, ratesCollectionId },
+    { metaDbId, metaCollectionId },
+    log,
+    logError
+) {
+    if (!oldDbId || !oldCollectionId) {
+        log(
+            "⚠️  MIGRATE_TO_NEW_DB=1 set, but old DATABASE_ID/COLLECTION_ID not provided — skipping migration."
+        );
+        return;
+    }
+    log("🔄 Migration start: old → new DBs");
+    const pageSize = 100;
+    let cursor = null;
+    let scanned = 0,
+        movedRates = 0,
+        movedMeta = 0,
+        strippedOld = 0;
+
+    while (true) {
+        const queries = [Query.orderDesc("$createdAt"), Query.limit(pageSize)];
+        if (cursor) queries.push(Query.cursorAfter(cursor));
+        const page = await db.listDocuments(oldDbId, oldCollectionId, queries);
+        if (!page.documents.length) break;
+
+        for (const doc of page.documents) {
+            scanned++;
+            const migratedDate = doc.date || doc.$id;
+            const ratesRecord = {
+                date: migratedDate,
+                fiatRates:
+                    typeof doc.fiatRates === "string"
+                        ? doc.fiatRates
+                        : JSON.stringify(doc.fiatRates ?? {}),
+                cryptoRates:
+                    typeof doc.cryptoRates === "string"
+                        ? doc.cryptoRates
+                        : JSON.stringify(doc.cryptoRates ?? []),
+            };
+            // Upsert rates in new DB
+            try {
+                const existing = await db.listDocuments(
+                    ratesDbId,
+                    ratesCollectionId,
+                    [Query.equal("date", migratedDate)]
+                );
+                const rId = existing.total
+                    ? existing.documents[0].$id
+                    : ID.unique();
+                if (existing.total) {
+                    await db.updateDocument(
+                        ratesDbId,
+                        ratesCollectionId,
+                        rId,
+                        ratesRecord
+                    );
+                } else {
+                    await db.createDocument(
+                        ratesDbId,
+                        ratesCollectionId,
+                        rId,
+                        ratesRecord
+                    );
+                }
+                movedRates++;
+            } catch (e) {
+                logError(
+                    "Rates upsert failed for",
+                    migratedDate,
+                    e?.message ?? e
+                );
+            }
+
+            // Upsert meta in meta DB (if exists in old doc)
+            if (doc.cryptoMeta && String(doc.cryptoMeta).length > 2) {
+                try {
+                    const metaString =
+                        typeof doc.cryptoMeta === "string"
+                            ? doc.cryptoMeta
+                            : JSON.stringify(doc.cryptoMeta);
+                    await upsertCryptoMetaDocument(
+                        db,
+                        metaDbId,
+                        metaCollectionId,
+                        migratedDate,
+                        metaString,
+                        log
+                    );
+                    movedMeta++;
+                } catch (e) {
+                    logError(
+                        "Meta upsert failed for",
+                        migratedDate,
+                        e?.message ?? e
+                    );
+                }
+                // Try to strip from old doc to lighten UI load
+                try {
+                    await db.updateDocument(oldDbId, oldCollectionId, doc.$id, {
+                        cryptoMeta: null,
+                    });
+                    strippedOld++;
+                } catch {
+                    try {
+                        await db.updateDocument(
+                            oldDbId,
+                            oldCollectionId,
+                            doc.$id,
+                            { cryptoMeta: "" }
+                        );
+                        strippedOld++;
+                    } catch {}
+                }
+            }
+        }
+        cursor = page.documents[page.documents.length - 1].$id;
+        if (page.documents.length < pageSize) break;
+    }
+    log(
+        `🔚 Migration complete. scanned=${scanned}, ratesUpserted=${movedRates}, metaUpserted=${movedMeta}, oldStripped=${strippedOld}`
+    );
 }
