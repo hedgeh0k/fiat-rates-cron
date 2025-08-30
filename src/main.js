@@ -1,23 +1,43 @@
 import { Client, Databases, Query, ID, Functions } from "node-appwrite";
 
-async function fetchWithRetry(url, opts = {}, max = 3, log = console.log) {
+// fetch with retries and a hard timeout per request (prevents silent long hangs)
+async function fetchWithRetry(
+    url,
+    opts = {},
+    max = 3,
+    log = console.log,
+    timeoutMs = 10000
+) {
     for (let attempt = 1; attempt <= max; ++attempt) {
         try {
-            const res = await fetch(url, opts);
+            const controller = new AbortController();
+            const t = setTimeout(
+                () => controller.abort(`timeout ${timeoutMs}ms`),
+                timeoutMs
+            );
+            const res = await fetch(url, {
+                ...opts,
+                signal: controller.signal,
+            });
+            clearTimeout(t);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return await res.json();
         } catch (e) {
-            log(`⚠️  ${url} failed (attempt ${attempt}):`, e.message);
+            log(
+                `⚠️  ${url} failed (attempt ${attempt}/${max}):`,
+                e?.message ?? e
+            );
             if (attempt === max) throw e;
-            await new Promise((r) => setTimeout(r, 2 ** attempt * 1_000));
+            await new Promise((r) => setTimeout(r, 2 ** attempt * 1000));
         }
     }
 }
 
 /** --------------- main entry --------------- */
 export default async function fetchAndSaveRates(context) {
-    const log = (...a) => (context?.log ?? console.log)(...a);
-    const logError = (...a) => (context?.error ?? console.error)(...a);
+    // Use console.* explicitly so Appwrite UI reliably captures logs
+    const log = (...a) => console.log("[rates]", ...a);
+    const logError = (...a) => console.error("[rates]", ...a);
 
     try {
         const client = new Client()
@@ -26,16 +46,17 @@ export default async function fetchAndSaveRates(context) {
             .setKey(process.env.APPWRITE_API_KEY);
 
         const db = new Databases(client);
-        const functions = new Functions(client); // for e-mail alert
+        const functions = new Functions(client); // for e-mail alert (reserved)
 
         const [fiatJson, cryptoRaw] = await Promise.all([
             fetchWithRetry(
                 `https://api.currencyapi.com/v3/latest?type=fiat&apikey=${process.env.RATES_API_KEY}`,
                 {},
                 2,
-                log
+                log,
+                10000
             ),
-            fetchCryptoMarketData(log, logError), // see below
+            fetchCryptoMarketData(log, logError),
         ]);
 
         const fiatRates = Object.entries(fiatJson?.data ?? {}).map(
@@ -96,8 +117,9 @@ export default async function fetchAndSaveRates(context) {
             throw new Error(
                 "Missing CRYPTOMETA_DATABASE_ID or CRYPTOMETA_COLLECTION_ID"
             );
+        log("env OK, starting upserts");
 
-        // Upsert today's rates (no cryptoMeta here)
+        // Upsert today's rates (no cryptoMeta here) — relies on 'date' attribute in schema
         const todaySearch = await db.listDocuments(
             ratesDbId,
             ratesCollectionId,
@@ -144,7 +166,7 @@ export default async function fetchAndSaveRates(context) {
             log("No crypto meta fetched today — skipping cryptoMeta upsert.");
         }
 
-        // Optional: full migration from old DB/collection → new DBs
+        // Optional: full migration from old DB/collection → new DBs (rates only)
         if (process.env.MIGRATE_TO_NEW_DB === "1") {
             await migrateFromOldToNewDatabases(
                 db,
@@ -184,18 +206,31 @@ async function fetchCryptoMarketData(
     const base = "https://api.cryptorank.io/v2/currencies";
     const headers = { "X-Api-Key": process.env.CRYPTORANK_API_KEY };
     const limit = 100;
+    const maxPages = Math.max(
+        1,
+        Number(process.env.CRYPTORANK_MAX_PAGES ?? 10)
+    ); // default cap: 1000 rows
     let skip = 0,
-        out = [];
+        out = [],
+        pageCount = 0;
 
     while (true) {
+        pageCount++;
         const { data = [] } = await fetchWithRetry(
             `${base}?limit=${limit}&skip=${skip}`,
             { headers },
             3,
-            log
+            log,
+            10000
         );
         out.push(...data);
         if (data.length < limit) break;
+        if (pageCount >= maxPages) {
+            log(
+                `CryptoRank page cap reached (${pageCount}/${maxPages}), stopping pagination to prevent timeout.`
+            );
+            break;
+        }
         skip += limit;
     }
     return out;
@@ -238,13 +273,11 @@ async function migrateFromOldToNewDatabases(
         );
         return;
     }
-    log("🔄 Migration start: old → new DBs");
+    log("🔄 Migration start: old → new DBs (rates only)");
     const pageSize = 100;
     let cursor = null;
     let scanned = 0,
-        movedRates = 0,
-        movedMeta = 0,
-        strippedOld = 0;
+        movedRates = 0;
 
     while (true) {
         const queries = [Query.orderDesc("$createdAt"), Query.limit(pageSize)];
@@ -299,53 +332,11 @@ async function migrateFromOldToNewDatabases(
                     e?.message ?? e
                 );
             }
-
-            // Upsert meta in meta DB (if exists in old doc)
-            if (doc.cryptoMeta && String(doc.cryptoMeta).length > 2) {
-                try {
-                    const metaString =
-                        typeof doc.cryptoMeta === "string"
-                            ? doc.cryptoMeta
-                            : JSON.stringify(doc.cryptoMeta);
-                    await upsertCryptoMetaDocument(
-                        db,
-                        metaDbId,
-                        metaCollectionId,
-                        migratedDate,
-                        metaString,
-                        log
-                    );
-                    movedMeta++;
-                } catch (e) {
-                    logError(
-                        "Meta upsert failed for",
-                        migratedDate,
-                        e?.message ?? e
-                    );
-                }
-                // Try to strip from old doc to lighten UI load
-                try {
-                    await db.updateDocument(oldDbId, oldCollectionId, doc.$id, {
-                        cryptoMeta: null,
-                    });
-                    strippedOld++;
-                } catch {
-                    try {
-                        await db.updateDocument(
-                            oldDbId,
-                            oldCollectionId,
-                            doc.$id,
-                            { cryptoMeta: "" }
-                        );
-                        strippedOld++;
-                    } catch {}
-                }
-            }
         }
         cursor = page.documents[page.documents.length - 1].$id;
         if (page.documents.length < pageSize) break;
     }
     log(
-        `🔚 Migration complete. scanned=${scanned}, ratesUpserted=${movedRates}, metaUpserted=${movedMeta}, oldStripped=${strippedOld}`
+        `🔚 Migration complete. scanned=${scanned}, ratesUpserted=${movedRates}`
     );
 }
