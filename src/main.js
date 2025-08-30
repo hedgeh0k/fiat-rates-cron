@@ -1,6 +1,14 @@
 import { Client, Databases, Query, ID, Functions } from "node-appwrite";
 
-// fetch with retries and a hard timeout per request (prevents silent long hangs)
+/* ===================== global crash handlers (so you see logs) ===================== */
+process.on("unhandledRejection", (reason) => {
+    console.error("[rates] UNHANDLED_REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+    console.error("[rates] UNCAUGHT_EXCEPTION:", err);
+});
+
+/* ===================== HTTP fetch with retries & per-request timeout ===================== */
 async function fetchWithRetry(
     url,
     opts = {},
@@ -12,7 +20,7 @@ async function fetchWithRetry(
         try {
             const controller = new AbortController();
             const t = setTimeout(
-                () => controller.abort(`timeout ${timeoutMs}ms`),
+                () => controller.abort(new Error(`timeout ${timeoutMs}ms`)),
                 timeoutMs
             );
             const res = await fetch(url, {
@@ -24,7 +32,7 @@ async function fetchWithRetry(
             return await res.json();
         } catch (e) {
             log(
-                `⚠️  ${url} failed (attempt ${attempt}/${max}):`,
+                `[fetch] ${url} failed (attempt ${attempt}/${max}):`,
                 e?.message ?? e
             );
             if (attempt === max) throw e;
@@ -33,32 +41,112 @@ async function fetchWithRetry(
     }
 }
 
-/** --------------- main entry --------------- */
+/* ===================== tiny helpers ===================== */
+function okRes(context, payload) {
+    // Support both old/new function APIs
+    if (context?.res?.json) return context.res.json(payload);
+    return payload;
+}
+function errRes(context, message, extra = {}) {
+    console.error("[rates] ERROR:", message, extra);
+    if (context?.res?.json)
+        return context.res.json({
+            ok: false,
+            error: String(message),
+            ...extra,
+        });
+    return { ok: false, error: String(message), ...extra };
+}
+
+/* ===================== main entry ===================== */
 export default async function fetchAndSaveRates(context) {
-    // Use console.* explicitly so Appwrite UI reliably captures logs
     const log = (...a) => console.log("[rates]", ...a);
     const logError = (...a) => console.error("[rates]", ...a);
 
+    log("START execution");
+
+    /* ---- ENV presence ---- */
+    const {
+        PROJECT_ID,
+        APPWRITE_API_KEY,
+        RATES_API_KEY,
+        RATES1_DATABASE_ID,
+        RATES_COMBINED_COLLECTION_ID,
+        CRYPTORANK_API_KEY,
+        CRYPTOMETA_DATABASE_ID,
+        CRYPTOMETA_COLLECTION_ID,
+        CRYPTORANK_MAX_PAGES,
+        MIGRATE_TO_NEW_DB,
+        DATABASE_ID,
+        COLLECTION_ID,
+    } = process.env;
+
+    const missingEnv = [];
+    if (!PROJECT_ID) missingEnv.push("PROJECT_ID");
+    if (!APPWRITE_API_KEY) missingEnv.push("APPWRITE_API_KEY");
+    if (!RATES_API_KEY) missingEnv.push("RATES_API_KEY");
+    if (!RATES1_DATABASE_ID) missingEnv.push("RATES1_DATABASE_ID");
+    if (!RATES_COMBINED_COLLECTION_ID)
+        missingEnv.push("RATES_COMBINED_COLLECTION_ID");
+    if (!CRYPTOMETA_DATABASE_ID) missingEnv.push("CRYPTOMETA_DATABASE_ID");
+    if (!CRYPTOMETA_COLLECTION_ID) missingEnv.push("CRYPTOMETA_COLLECTION_ID");
+
+    if (missingEnv.length) {
+        return errRes(context, "Missing required env vars", { missingEnv });
+    }
+
     try {
+        /* ---- Appwrite clients ---- */
         const client = new Client()
             .setEndpoint("https://cloud.appwrite.io/v1")
-            .setProject(process.env.PROJECT_ID)
-            .setKey(process.env.APPWRITE_API_KEY);
-
+            .setProject(PROJECT_ID)
+            .setKey(APPWRITE_API_KEY);
         const db = new Databases(client);
-        const functions = new Functions(client); // for e-mail alert (reserved)
+        // eslint-disable-next-line no-unused-vars
+        const functions = new Functions(client);
+        log("Appwrite SDK initialized");
 
-        const [fiatJson, cryptoRaw] = await Promise.all([
-            fetchWithRetry(
-                `https://api.currencyapi.com/v3/latest?type=fiat&apikey=${process.env.RATES_API_KEY}`,
-                {},
-                2,
-                log,
-                10000
-            ),
-            fetchCryptoMarketData(log, logError),
+        /* ---- Fetch data (with clear logs per step) ---- */
+        log("Fetching fiat & crypto in parallel...");
+        const fiatPromise = fetchWithRetry(
+            `https://api.currencyapi.com/v3/latest?type=fiat&apikey=${RATES_API_KEY}`,
+            {},
+            2,
+            (m, ...rest) => console.log("[fiat]", m, ...rest),
+            10000
+        );
+        const cryptoPromise = fetchCryptoMarketData(
+            (m, ...rest) => console.log("[crypto]", m, ...rest),
+            (m, ...rest) => console.error("[crypto]", m, ...rest),
+            CRYPTORANK_API_KEY,
+            CRYPTORANK_MAX_PAGES
+        );
+
+        const [fiatRes, cryptoRes] = await Promise.allSettled([
+            fiatPromise,
+            cryptoPromise,
         ]);
 
+        if (fiatRes.status !== "fulfilled") {
+            return errRes(context, "Fiat fetch failed", {
+                reason: String(fiatRes.reason?.message ?? fiatRes.reason),
+            });
+        }
+        if (cryptoRes.status !== "fulfilled") {
+            // Continue without crypto if you prefer; here we fail loudly so you notice
+            return errRes(context, "Crypto fetch failed", {
+                reason: String(cryptoRes.reason?.message ?? cryptoRes.reason),
+            });
+        }
+
+        const fiatJson = fiatRes.value;
+        const cryptoRaw = cryptoRes.value;
+
+        log(
+            `Fetched fiat=${Object.keys(fiatJson?.data ?? {}).length} codes, crypto=${cryptoRaw.length} rows`
+        );
+
+        /* ---- Transform ---- */
         const fiatRates = Object.entries(fiatJson?.data ?? {}).map(
             ([code, { value }]) => [code, value]
         );
@@ -93,141 +181,195 @@ export default async function fetchAndSaveRates(context) {
             (c) => !fiatRates.some(([code]) => code === c)
         );
         const hasBTC = cryptoRates.some(([sym]) => sym === "BTC");
+        log("Sanity check:", { missingFiat, hasBTC });
 
         if (missingFiat.length || !hasBTC) {
-            throw new Error("Sanity check failed, aborting save");
+            return errRes(context, "Sanity check failed", {
+                missingFiat,
+                hasBTC,
+            });
         }
 
         /* ----------- Upsert in new DBs --------------- */
         const dateStr = new Date()
             .toLocaleDateString("en-GB")
             .replace(/\//g, "");
+        log("Using date key:", dateStr);
 
-        // Target: new rates database/collection
-        const ratesDbId = process.env.RATES1_DATABASE_ID;
-        const ratesCollectionId = process.env.RATES_COMBINED_COLLECTION_ID;
-        const metaDbId = process.env.CRYPTOMETA_DATABASE_ID;
-        const metaCollectionId = process.env.CRYPTOMETA_COLLECTION_ID;
-
-        if (!ratesDbId || !ratesCollectionId)
-            throw new Error(
-                "Missing RATES1_DATABASE_ID or RATES_COMBINED_COLLECTION_ID"
-            );
-        if (!metaDbId || !metaCollectionId)
-            throw new Error(
-                "Missing CRYPTOMETA_DATABASE_ID or CRYPTOMETA_COLLECTION_ID"
-            );
-        log("env OK, starting upserts");
-
-        // Upsert today's rates (no cryptoMeta here) — relies on 'date' attribute in schema
-        const todaySearch = await db.listDocuments(
-            ratesDbId,
-            ratesCollectionId,
-            [Query.equal("date", dateStr)]
-        );
-        const docId = todaySearch.total
-            ? todaySearch.documents[0].$id
-            : ID.unique();
+        /* ---- Upsert rates (primary collection) ---- */
         const ratesRecord = {
             date: dateStr,
             fiatRates: JSON.stringify(fiatRates),
             cryptoRates: JSON.stringify(cryptoRates),
         };
 
-        if (todaySearch.total) {
-            log("Updating rates doc (new DB)", docId);
-            await db.updateDocument(
-                ratesDbId,
-                ratesCollectionId,
-                docId,
-                ratesRecord
+        log("Upserting rates (query by date)...");
+        let ratesDocId = null;
+        try {
+            const todaySearch = await db.listDocuments(
+                RATES1_DATABASE_ID,
+                RATES_COMBINED_COLLECTION_ID,
+                [Query.equal("date", dateStr)]
             );
-        } else {
-            log("Creating rates doc (new DB)", docId);
-            await db.createDocument(
-                ratesDbId,
-                ratesCollectionId,
-                docId,
-                ratesRecord
+            ratesDocId = todaySearch.total
+                ? todaySearch.documents[0].$id
+                : ID.unique();
+
+            if (todaySearch.total) {
+                log("Updating rates doc", ratesDocId);
+                await db.updateDocument(
+                    RATES1_DATABASE_ID,
+                    RATES_COMBINED_COLLECTION_ID,
+                    ratesDocId,
+                    ratesRecord
+                );
+            } else {
+                log("Creating rates doc", ratesDocId);
+                await db.createDocument(
+                    RATES1_DATABASE_ID,
+                    RATES_COMBINED_COLLECTION_ID,
+                    ratesDocId,
+                    ratesRecord
+                );
+            }
+        } catch (e) {
+            // If schema/index is missing (e.g., "Attribute not found in schema: date")
+            const msg = String(e?.message ?? e);
+            logError(
+                "Rates upsert via query failed, will fallback to ID:",
+                msg
             );
+            ratesDocId = dateStr; // stable ID for today
+            try {
+                await db.createDocument(
+                    RATES1_DATABASE_ID,
+                    RATES_COMBINED_COLLECTION_ID,
+                    ratesDocId,
+                    ratesRecord
+                );
+                log("Created rates doc (by ID)", ratesDocId);
+            } catch (e2) {
+                // If already exists: update
+                try {
+                    await db.updateDocument(
+                        RATES1_DATABASE_ID,
+                        RATES_COMBINED_COLLECTION_ID,
+                        ratesDocId,
+                        ratesRecord
+                    );
+                    log("Updated rates doc (by ID)", ratesDocId);
+                } catch (e3) {
+                    return errRes(context, "Rates upsert failed", {
+                        e: String(e3?.message ?? e3),
+                    });
+                }
+            }
         }
 
-        // Upsert today's cryptoMeta into its dedicated database/collection
+        /* ---- Upsert today's cryptoMeta (separate DB/collection) ---- */
         if (cryptoRaw.length) {
-            await upsertCryptoMetaDocument(
-                db,
-                metaDbId,
-                metaCollectionId,
-                dateStr,
-                JSON.stringify(cryptoMeta),
-                log
-            );
+            const metaPayload = {
+                date: dateStr,
+                cryptoMeta: JSON.stringify(cryptoMeta),
+            };
+            const metaDocId = dateStr; // per-day doc id
+            log("Upserting cryptoMeta doc", metaDocId);
+            try {
+                await db.createDocument(
+                    CRYPTOMETA_DATABASE_ID,
+                    CRYPTOMETA_COLLECTION_ID,
+                    metaDocId,
+                    metaPayload
+                );
+                log("Created cryptoMeta", metaDocId);
+            } catch (e) {
+                try {
+                    await db.updateDocument(
+                        CRYPTOMETA_DATABASE_ID,
+                        CRYPTOMETA_COLLECTION_ID,
+                        metaDocId,
+                        metaPayload
+                    );
+                    log("Updated cryptoMeta", metaDocId);
+                } catch (e2) {
+                    return errRes(context, "cryptoMeta upsert failed", {
+                        e: String(e2?.message ?? e2),
+                    });
+                }
+            }
         } else {
-            log("No crypto meta fetched today — skipping cryptoMeta upsert.");
+            log("No crypto meta today — skipping meta upsert");
         }
 
-        // Optional: full migration from old DB/collection → new DBs (rates only)
-        if (process.env.MIGRATE_TO_NEW_DB === "1") {
-            await migrateFromOldToNewDatabases(
-                db,
-                {
-                    oldDbId: process.env.DATABASE_ID,
-                    oldCollectionId: process.env.COLLECTION_ID,
-                },
-                {
-                    ratesDbId,
-                    ratesCollectionId,
-                },
-                {
-                    metaDbId,
-                    metaCollectionId,
-                },
-                log,
-                logError
-            );
+        /* ---- Optional migration: RATES ONLY ---- */
+        if (MIGRATE_TO_NEW_DB === "1") {
+            log("Starting migration of old rates → new rates...");
+            try {
+                await migrateFromOldToNewDatabases(
+                    db,
+                    { oldDbId: DATABASE_ID, oldCollectionId: COLLECTION_ID },
+                    {
+                        ratesDbId: RATES1_DATABASE_ID,
+                        ratesCollectionId: RATES_COMBINED_COLLECTION_ID,
+                    },
+                    {
+                        metaDbId: CRYPTOMETA_DATABASE_ID,
+                        metaCollectionId: CRYPTOMETA_COLLECTION_ID,
+                    },
+                    log,
+                    logError
+                );
+                log("Migration finished");
+            } catch (e) {
+                logError("Migration crashed:", e?.message ?? e);
+            }
         }
 
-        log("✅ Rates stored", docId);
-        return context?.res?.json({ ok: true });
+        log("DONE. ratesDocId:", ratesDocId);
+        return okRes(context, { ok: true, ratesDocId });
     } catch (err) {
-        logError("⛔ Cron failed:", err);
-        return context?.res?.json({ ok: false, error: String(err) });
+        // Any error that escaped the above will be logged here
+        logError("FATAL:", err?.message ?? err, err?.stack);
+        return errRes(context, "Fatal error", { stack: err?.stack });
     }
 }
 
+/* ===================== Crypto fetch: paginated + timeouts + cap ===================== */
 async function fetchCryptoMarketData(
     log = console.log,
-    logError = console.error
+    logError = console.error,
+    apiKey,
+    maxPagesEnv
 ) {
-    if (!process.env.CRYPTORANK_API_KEY) {
+    if (!apiKey) {
         log("CryptoRank key absent → skip crypto");
         return [];
     }
     const base = "https://api.cryptorank.io/v2/currencies";
-    const headers = { "X-Api-Key": process.env.CRYPTORANK_API_KEY };
+    const headers = { "X-Api-Key": apiKey };
     const limit = 100;
-    const maxPages = Math.max(
-        1,
-        Number(process.env.CRYPTORANK_MAX_PAGES ?? 10)
-    ); // default cap: 1000 rows
-    let skip = 0,
-        out = [],
-        pageCount = 0;
+    const maxPages = Math.max(1, Number(maxPagesEnv ?? 10)); // default cap: 1000 rows
+    let skip = 0;
+    let out = [];
+    let pageCount = 0;
 
     while (true) {
         pageCount++;
+        const url = `${base}?limit=${limit}&skip=${skip}`;
+        log(`GET ${url} (page ${pageCount}/${maxPages})`);
         const { data = [] } = await fetchWithRetry(
-            `${base}?limit=${limit}&skip=${skip}`,
+            url,
             { headers },
             3,
             log,
             10000
         );
         out.push(...data);
+        log(`Fetched ${data.length} rows; total=${out.length}`);
         if (data.length < limit) break;
         if (pageCount >= maxPages) {
             log(
-                `CryptoRank page cap reached (${pageCount}/${maxPages}), stopping pagination to prevent timeout.`
+                `Page cap ${maxPages} reached; stopping pagination to prevent timeout`
             );
             break;
         }
@@ -236,7 +378,7 @@ async function fetchCryptoMarketData(
     return out;
 }
 
-// ---------- helpers: meta upsert + full-database migration ----------
+/* ===================== DB helpers ===================== */
 async function upsertCryptoMetaDocument(
     db,
     databaseId,
@@ -259,6 +401,7 @@ async function upsertCryptoMetaDocument(
     }
 }
 
+// RATES-ONLY migration. Leaves cryptoMeta alone.
 async function migrateFromOldToNewDatabases(
     db,
     { oldDbId, oldCollectionId },
@@ -299,7 +442,7 @@ async function migrateFromOldToNewDatabases(
                         ? doc.cryptoRates
                         : JSON.stringify(doc.cryptoRates ?? []),
             };
-            // Upsert rates in new DB
+
             try {
                 const existing = await db.listDocuments(
                     ratesDbId,
@@ -333,6 +476,7 @@ async function migrateFromOldToNewDatabases(
                 );
             }
         }
+
         cursor = page.documents[page.documents.length - 1].$id;
         if (page.documents.length < pageSize) break;
     }
