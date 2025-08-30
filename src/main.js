@@ -214,7 +214,6 @@ async function upsertCryptoMetaDocument(
     const payload = {
         date: dateStr,
         cryptoMeta: metaString,
-        symbolsCount: safeCountSymbols(metaString),
     };
     try {
         await db.createDocument(databaseId, collectionId, metaDocId, payload);
@@ -222,14 +221,6 @@ async function upsertCryptoMetaDocument(
     } catch (e) {
         await db.updateDocument(databaseId, collectionId, metaDocId, payload);
         log("Updated cryptoMeta doc", metaDocId);
-    }
-};
-
-function safeCountSymbols(metaString) {
-    try {
-        return Object.keys(JSON.parse(metaString)).length;
-    } catch {
-        return 0;
     }
 }
 
