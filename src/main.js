@@ -2,10 +2,19 @@ import { Client, Databases, Query, ID, Functions } from "node-appwrite";
 
 /* ===================== global crash handlers (so you see logs) ===================== */
 process.on("unhandledRejection", (reason) => {
-    console.error("[rates] UNHANDLED_REJECTION:", reason);
+    const msg = `[rates] UNHANDLED_REJECTION: ${reason?.stack || reason}`;
+    console.error(msg);
+    try {
+        globalThis.__appwriteCtx?.error?.(msg);
+    } catch {}
 });
+
 process.on("uncaughtException", (err) => {
-    console.error("[rates] UNCAUGHT_EXCEPTION:", err);
+    const msg = `[rates] UNCAUGHT_EXCEPTION: ${err?.stack || err}`;
+    console.error(msg);
+    try {
+        globalThis.__appwriteCtx?.error?.(msg);
+    } catch {}
 });
 
 /* ===================== HTTP fetch with retries & per-request timeout ===================== */
@@ -42,26 +51,59 @@ async function fetchWithRetry(
 }
 
 /* ===================== tiny helpers ===================== */
-function okRes(context, payload) {
-    // Support both old/new function APIs
-    if (context?.res?.json) return context.res.json(payload);
-    return payload;
-}
-function errRes(context, message, extra = {}) {
-    console.error("[rates] ERROR:", message, extra);
-    if (context?.res?.json)
-        return context.res.json({
-            ok: false,
-            error: String(message),
-            ...extra,
+function okRes(context, payload, status = 200) {
+    // Prefer Appwrite's response API so the UI shows status + body
+    const body = JSON.stringify(payload ?? { ok: true });
+    if (context?.res?.send) {
+        return context.res.send(body, status, {
+            "content-type": "application/json",
         });
-    return { ok: false, error: String(message), ...extra };
+    }
+    if (context?.res?.json) return context.res.json(payload);
+    return payload; // fallback for non-HTTP triggers
+}
+
+function errRes(context, message, extra = {}, status = 500) {
+    const body = { ok: false, error: String(message), ...extra };
+    try {
+        context?.error?.(
+            `[rates] ERROR: ${String(message)}${extra ? " " + JSON.stringify(extra) : ""}`
+        );
+    } catch {}
+    console.error("[rates] ERROR:", message, extra);
+    if (context?.res?.send) {
+        return context.res.send(JSON.stringify(body), status, {
+            "content-type": "application/json",
+        });
+    }
+    if (context?.res?.json) return context.res.json(body);
+    return body;
 }
 
 /* ===================== main entry ===================== */
 export default async function fetchAndSaveRates(context) {
-    const log = (...a) => console.log("[rates]", ...a);
-    const logError = (...a) => console.error("[rates]", ...a);
+    // Expose context to global crash handlers (so uncaught errors appear in UI)
+    globalThis.__appwriteCtx = context;
+
+    // Tee logs to both Appwrite logger and console to guarantee visibility
+    const log = (...a) => {
+        const line = ["[rates]", ...a]
+            .map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+            .join(" ");
+        try {
+            context?.log?.(line);
+        } catch {}
+        console.log(line);
+    };
+    const logError = (...a) => {
+        const line = ["[rates]", ...a]
+            .map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+            .join(" ");
+        try {
+            context?.error?.(line) ?? context?.log?.(line);
+        } catch {}
+        console.error(line);
+    };
 
     log("START execution");
 
@@ -92,7 +134,12 @@ export default async function fetchAndSaveRates(context) {
     if (!CRYPTOMETA_COLLECTION_ID) missingEnv.push("CRYPTOMETA_COLLECTION_ID");
 
     if (missingEnv.length) {
-        return errRes(context, "Missing required env vars", { missingEnv });
+        return errRes(
+            context,
+            "Missing required env vars",
+            { missingEnv },
+            500
+        );
     }
 
     try {
@@ -112,12 +159,42 @@ export default async function fetchAndSaveRates(context) {
             `https://api.currencyapi.com/v3/latest?type=fiat&apikey=${RATES_API_KEY}`,
             {},
             2,
-            (m, ...rest) => console.log("[fiat]", m, ...rest),
+            (m, ...rest) => {
+                log(
+                    `[fiat] ${m} ${rest.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
+                );
+                // try {
+                //     context?.log?.(
+                //         `[fiat] ${m} ${rest.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
+                //     );
+                // } catch {}
+                // console.log("[fiat]", m, ...rest);
+            },
             10000
         );
         const cryptoPromise = fetchCryptoMarketData(
-            (m, ...rest) => console.log("[crypto]", m, ...rest),
-            (m, ...rest) => console.error("[crypto]", m, ...rest),
+            (m, ...rest) => {
+                log(
+                    `[crypto] ${m} ${rest.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
+                );
+                // try {
+                //     context?.log?.(
+                //         `[crypto] ${m} ${rest.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
+                //     );
+                // } catch {}
+                // console.log("[crypto]", m, ...rest);
+            },
+            (m, ...rest) => {
+                log(
+                    `[crypto] ${m} ${rest.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
+                );
+                // try {
+                //     context?.error?.(
+                //         `[crypto] ${m} ${rest.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
+                //     );
+                // } catch {}
+                // console.error("[crypto]", m, ...rest);
+            },
             CRYPTORANK_API_KEY,
             CRYPTORANK_MAX_PAGES
         );
@@ -128,15 +205,25 @@ export default async function fetchAndSaveRates(context) {
         ]);
 
         if (fiatRes.status !== "fulfilled") {
-            return errRes(context, "Fiat fetch failed", {
-                reason: String(fiatRes.reason?.message ?? fiatRes.reason),
-            });
+            return errRes(
+                context,
+                "Fiat fetch failed",
+                { reason: String(fiatRes.reason?.message ?? fiatRes.reason) },
+                502
+            );
         }
         if (cryptoRes.status !== "fulfilled") {
-            // Continue without crypto if you prefer; here we fail loudly so you notice
-            return errRes(context, "Crypto fetch failed", {
-                reason: String(cryptoRes.reason?.message ?? cryptoRes.reason),
-            });
+            // (Option: continue without crypto. For now, fail loudly to surface the problem.)
+            return errRes(
+                context,
+                "Crypto fetch failed",
+                {
+                    reason: String(
+                        cryptoRes.reason?.message ?? cryptoRes.reason
+                    ),
+                },
+                502
+            );
         }
 
         const fiatJson = fiatRes.value;
@@ -184,10 +271,12 @@ export default async function fetchAndSaveRates(context) {
         log("Sanity check:", { missingFiat, hasBTC });
 
         if (missingFiat.length || !hasBTC) {
-            return errRes(context, "Sanity check failed", {
-                missingFiat,
-                hasBTC,
-            });
+            return errRes(
+                context,
+                "Sanity check failed",
+                { missingFiat, hasBTC },
+                500
+            );
         }
 
         /* ----------- Upsert in new DBs --------------- */
@@ -233,7 +322,7 @@ export default async function fetchAndSaveRates(context) {
                 );
             }
         } catch (e) {
-            // If schema/index is missing (e.g., "Attribute not found in schema: date")
+            // If schema/index is missing (e.g., "Attribute not found in schema: date") — fallback to using ID = date
             const msg = String(e?.message ?? e);
             logError(
                 "Rates upsert via query failed, will fallback to ID:",
@@ -259,9 +348,12 @@ export default async function fetchAndSaveRates(context) {
                     );
                     log("Updated rates doc (by ID)", ratesDocId);
                 } catch (e3) {
-                    return errRes(context, "Rates upsert failed", {
-                        e: String(e3?.message ?? e3),
-                    });
+                    return errRes(
+                        context,
+                        "Rates upsert failed",
+                        { e: String(e3?.message ?? e3) },
+                        500
+                    );
                 }
             }
         }
@@ -292,9 +384,12 @@ export default async function fetchAndSaveRates(context) {
                     );
                     log("Updated cryptoMeta", metaDocId);
                 } catch (e2) {
-                    return errRes(context, "cryptoMeta upsert failed", {
-                        e: String(e2?.message ?? e2),
-                    });
+                    return errRes(
+                        context,
+                        "cryptoMeta upsert failed",
+                        { e: String(e2?.message ?? e2) },
+                        500
+                    );
                 }
             }
         } else {
@@ -326,11 +421,11 @@ export default async function fetchAndSaveRates(context) {
         }
 
         log("DONE. ratesDocId:", ratesDocId);
-        return okRes(context, { ok: true, ratesDocId });
+        return okRes(context, { ok: true, ratesDocId }, 200);
     } catch (err) {
         // Any error that escaped the above will be logged here
         logError("FATAL:", err?.message ?? err, err?.stack);
-        return errRes(context, "Fatal error", { stack: err?.stack });
+        return errRes(context, "Fatal error", { stack: err?.stack }, 500);
     }
 }
 
